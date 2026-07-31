@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Python caches (in case verifier scripts are run locally)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+sqlite_mcp_server.db
+
+# Internal convenience / tooling outputs (not shipped to the client)
+category_audit.csv
+dropped.csv

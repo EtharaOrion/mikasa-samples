@@ -1,0 +1,495 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..77d86b5
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,19 @@
++#!/bin/bash
++set -e
++cd "$(dirname "$0")"
++
++case "$1" in
++  base)
++    # Exclude the vendored testify library's own self-tests (internal/testify/*), which include
++    # timing-flaky cases like TestEventuallyTrue (assert.Eventually deadline). They test the
++    # vendored lib, not expr's error handling feature, and flake under load.
++    go test $(go list ./... | grep -v '/internal/testify')
++    ;;
++  new)
++    go test -v -tags=structerr ./test/structerr/
++    ;;
++  *)
++    echo "Usage: ./test.sh {base|new}"
++    exit 1
++    ;;
++esac
+diff --git a/test/structerr/structerr_test.go b/test/structerr/structerr_test.go
+new file mode 100644
+index 0000000..1b8522a
+--- /dev/null
++++ b/test/structerr/structerr_test.go
+@@ -0,0 +1,464 @@
++//go:build structerr
++
++package structerr_test
++
++// Held-out behavioral tests for the structured error handling feature set:
++// try/catch/finally, throw, retry, first-class error values, error
++// classification, rethrow/causes/rootcause, scoped/defer cleanup, and the
++// constant-folding guarantee. Only the public API is used.
++
++import (
++	"fmt"
++	"math"
++	"strings"
++	"testing"
++
++	"github.com/expr-lang/expr"
++)
++
++func childEHRun(t *testing.T, code string, env any) any {
++	t.Helper()
++	var opts []expr.Option
++	if env != nil {
++		opts = append(opts, expr.Env(env))
++	}
++	program, err := expr.Compile(code, opts...)
++	if err != nil {
++		t.Fatalf("compile error for %q: %v", code, err)
++	}
++	out, err := expr.Run(program, env)
++	if err != nil {
++		t.Fatalf("run error for %q: %v", code, err)
++	}
++	return out
++}
++
++func childEHRunErr(t *testing.T, code string, env any) error {
++	t.Helper()
++	var opts []expr.Option
++	if env != nil {
++		opts = append(opts, expr.Env(env))
++	}
++	program, err := expr.Compile(code, opts...)
++	if err != nil {
++		t.Fatalf("compile error for %q: %v", code, err)
++	}
++	_, err = expr.Run(program, env)
++	if err == nil {
++		t.Fatalf("expected run error for %q, got none", code)
++	}
++	return err
++}
++
++func childEHEq(t *testing.T, want, got any, code string) {
++	t.Helper()
++	if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", want) {
++		t.Fatalf("%q: expected %v, got %v", code, want, got)
++	}
++}
++
++// --- Parent surface: try(expr, fallback) builtin -------------------------
++
++func TestChildEH_TryBuiltin_SuccessAndFallback(t *testing.T) {
++	childEHEq(t, 3, childEHRun(t, `try(len("abc"), "fb")`, nil), "success path")
++	childEHEq(t, "fb", childEHRun(t, `try(throw("boom"), "fb")`, nil), "fallback path")
++	childEHEq(t, "fb", childEHRun(t, `try([1,2,3][10], "fb")`, nil), "runtime index error")
++}
++
++func TestChildEH_TryBuiltin_LazyFallbackAndArity(t *testing.T) {
++	calls := 0
++	env := map[string]any{
++		"sideEffect": func() any { calls++; return "unused" },
++	}
++	childEHEq(t, 1, childEHRun(t, `try(1, sideEffect())`, env), "lazy fallback")
++	if calls != 0 {
++		t.Fatalf("fallback must be lazily evaluated, sideEffect called %d times", calls)
++	}
++	if _, err := expr.Compile(`try(1)`); err == nil {
++		t.Fatal("try requires exactly two arguments: try(1) must not compile")
++	}
++	if _, err := expr.Compile(`try(1, 2, 3)`); err == nil {
++		t.Fatal("try requires exactly two arguments: try(1, 2, 3) must not compile")
++	}
++}
++
++// --- Parent surface: block try/catch still works -------------------------
++
++func TestChildEH_ParentSurface_BlockTryCatch(t *testing.T) {
++	childEHEq(t, "caught", childEHRun(t, `try { throw("bad thing") } catch { "caught" }`, nil), "bare catch")
++	childEHEq(t, "bad thing", childEHRun(t, `try { throw("bad thing") } catch e { errmsg(e) }`, nil), "bound catch")
++	childEHEq(t, 42, childEHRun(t, `try { 42 } catch { 0 }`, nil), "no error keeps value")
++}
++
++func TestChildEH_ParentSurface_SingleFilterAndFinally(t *testing.T) {
++	childEHEq(t, "matched", childEHRun(t, `try { throw("a bad thing") } catch e is "bad" { "matched" }`, nil), "substring filter")
++	var order []string
++	env := map[string]any{
++		"log": func(s string) any { order = append(order, s); return nil },
++	}
++	childEHEq(t, "ok", childEHRun(t, `try { "ok" } catch { "no" } finally { log("fin") }`, env), "finally on success")
++	if len(order) != 1 || order[0] != "fin" {
++		t.Fatalf("finally must run on success, got %v", order)
++	}
++}
++
++// --- Error values: construction and accessors ----------------------------
++
++func TestChildEH_ErrorValue_ConstructAndAccessors(t *testing.T) {
++	childEHEq(t, "db down", childEHRun(t, `errmsg(error("db down", "db", {"host": "x"}))`, nil), "errmsg")
++	childEHEq(t, "db", childEHRun(t, `errtag(error("db down", "db", {"host": "x"}))`, nil), "errtag")
++	childEHEq(t, "x", childEHRun(t, `errmeta(error("db down", "db", {"host": "x"})).host`, nil), "errmeta")
++	// error() constructs without throwing.
++	childEHEq(t, "after", childEHRun(t, `let e = error("m"); "after"`, nil), "no throw on construction")
++}
++
++func TestChildEH_ErrorValue_MissingTagAndMetadata(t *testing.T) {
++	childEHEq(t, "", childEHRun(t, `errtag(error("only message"))`, nil), "missing tag is empty string")
++	childEHEq(t, 0, childEHRun(t, `len(errmeta(error("only message")))`, nil), "missing metadata is empty map")
++	childEHEq(t, "", childEHRun(t, `try { [1][3] } catch e { errtag(e) }`, nil), "runtime errors carry no tag")
++}
++
++func TestChildEH_ErrorValue_AccessorsRequireError(t *testing.T) {
++	for _, code := range []string{`errmsg(42)`, `errtag("nope")`, `errmeta(1.5)`} {
++		err := childEHRunErr(t, code, nil)
++		if !strings.Contains(err.Error(), "error value") {
++			t.Fatalf("%q: expected error-value type error, got %v", code, err)
++		}
++	}
++	// The failure is a runtime error, hence catchable.
++	childEHEq(t, "caught", childEHRun(t, `try { errmsg(42) } catch { "caught" }`, nil), "accessor error catchable")
++}
++
++// --- throw ---------------------------------------------------------------
++
++func TestChildEH_Throw_PreservesErrorValues(t *testing.T) {
++	code := `try { throw(error("m", "t", {"n": 7})) } catch e { errmsg(e) + "|" + errtag(e) + "|" + string(errmeta(e).n) }`
++	childEHEq(t, "m|t|7", childEHRun(t, code, nil), "throw preserves error value")
++	// Rethrowing a caught error value keeps message, tag and metadata.
++	code = `try { try { throw(error("m", "t", {"n": 7})) } catch e { throw(e) } } catch e2 { errtag(e2) + string(errmeta(e2).n) }`
++	childEHEq(t, "t7", childEHRun(t, code, nil), "re-throw of caught error value")
++}
++
++func TestChildEH_Throw_ConvertsOtherValues(t *testing.T) {
++	childEHEq(t, "plain", childEHRun(t, `try { throw("plain") } catch e { errmsg(e) }`, nil), "string throw")
++	childEHEq(t, "42", childEHRun(t, `try { throw(42) } catch e { errmsg(e) }`, nil), "number throw uses string conversion")
++	if _, err := expr.Compile(`throw()`); err == nil {
++		t.Fatal("throw requires exactly one argument: throw() must not compile")
++	}
++	if _, err := expr.Compile(`throw(1, 2)`); err == nil {
++		t.Fatal("throw requires exactly one argument: throw(1, 2) must not compile")
++	}
++}
++
++// --- Multiple catch arms, ordering, matchers -----------------------------
++
++func TestChildEH_CatchArms_FirstMatchWins(t *testing.T) {
++	// Both arms match; the first one runs.
++	code := `try { throw(error("db down", "db")) } catch a is "db" { "message-arm" } catch b is #db { "tag-arm" }`
++	childEHEq(t, "message-arm", childEHRun(t, code, nil), "first matching arm wins")
++	code = `try { throw(error("db down", "db")) } catch a is #db { "first" } catch b is #db { "second" }`
++	childEHEq(t, "first", childEHRun(t, code, nil), "first of two identical tag arms")
++}
++
++func TestChildEH_CatchArms_TagDispatch(t *testing.T) {
++	code := `try { throw(error("x", "net")) } catch e is #db { "db" } catch e is #net { "net" } catch e { "any" }`
++	childEHEq(t, "net", childEHRun(t, code, nil), "dispatch on tag skips non-matching arms")
++	code = `try { throw(error("x", "other")) } catch e is #db { "db" } catch e is #net { "net" } catch e { "any:" + errtag(e) }`
++	childEHEq(t, "any:other", childEHRun(t, code, nil), "catch-all arm matches anything and binds")
++}
++
++func TestChildEH_CatchArms_SubstringVsTag(t *testing.T) {
++	// The substring matcher inspects the message, not the tag.
++	code := `try { throw(error("timeout while dialing", "net")) } catch e is "net" { "substr" } catch e is #net { "tag" }`
++	childEHEq(t, "tag", childEHRun(t, code, nil), "substring matcher must not match the tag")
++	// The tag matcher requires equality, not substring.
++	code = `try { throw(error("x", "network")) } catch e is #net { "tag" } catch e { "fallthrough" }`
++	childEHEq(t, "fallthrough", childEHRun(t, code, nil), "tag matcher is exact equality")
++	// Tag matcher never matches untagged runtime errors.
++	code = `try { try { [1][9] } catch e is #index { "tag" } } catch e { "outer" }`
++	childEHEq(t, "outer", childEHRun(t, code, nil), "tag arm does not match untagged error")
++}
++
++func TestChildEH_CatchArms_NoMatchPropagates(t *testing.T) {
++	code := `try { try { throw("zebra") } catch e is "lion" { "inner" } } catch e { "outer:" + errmsg(e) }`
++	childEHEq(t, "outer:zebra", childEHRun(t, code, nil), "unmatched error propagates to outer try")
++	err := childEHRunErr(t, `try { throw("zebra") } catch e is "lion" { "inner" }`, nil)
++	if !strings.Contains(err.Error(), "zebra") {
++		t.Fatalf("unmatched error must propagate out of the program, got %v", err)
++	}
++}
++
++// --- finally -------------------------------------------------------------
++
++func TestChildEH_Finally_AlwaysRuns(t *testing.T) {
++	var order []string
++	env := map[string]any{
++		"log": func(s string) any { order = append(order, s); return nil },
++	}
++	// Success path.
++	childEHEq(t, 1, childEHRun(t, `try { 1 } catch { 2 } finally { log("a") }`, env), "success")
++	// Caught path.
++	childEHEq(t, 2, childEHRun(t, `try { throw("x") } catch { 2 } finally { log("b") }`, env), "caught")
++	// Unmatched path: finally still runs and the error still propagates.
++	err := childEHRunErr(t, `try { throw("zzz") } catch e is "aaa" { 1 } finally { log("c") }`, env)
++	if !strings.Contains(err.Error(), "zzz") {
++		t.Fatalf("expected original error after finally, got %v", err)
++	}
++	childEHEq(t, "[a b c]", fmt.Sprintf("%v", order), "finally ran on all three paths")
++}
++
++func TestChildEH_Finally_ThrowOverrides(t *testing.T) {
++	err := childEHRunErr(t, `try { 1 } catch { 2 } finally { throw("finboom") }`, nil)
++	if !strings.Contains(err.Error(), "finboom") {
++		t.Fatalf("finally error must override the result, got %v", err)
++	}
++	err = childEHRunErr(t, `try { throw("x") } catch { "handled" } finally { throw("fin2") }`, nil)
++	if !strings.Contains(err.Error(), "fin2") {
++		t.Fatalf("finally error must override the catch result, got %v", err)
++	}
++	// A throwing finally is itself catchable by an enclosing try.
++	code := `try { try { 1 } catch { 2 } finally { throw("fin3") } } catch e { errmsg(e) }`
++	childEHEq(t, "fin3", childEHRun(t, code, nil), "finally error caught by outer try")
++}
++
++// --- retry ---------------------------------------------------------------
++
++func TestChildEH_Retry_SucceedsAfterRetries(t *testing.T) {
++	calls := 0
++	env := map[string]any{
++		"flaky": func() any {
++			calls++
++			if calls < 3 {
++				panic(fmt.Errorf("flaky failure"))
++			}
++			return "ok"
++		},
++	}
++	childEHEq(t, "ok", childEHRun(t, `try { flaky() } catch e { retry }`, env), "retry until success")
++	if calls != 3 {
++		t.Fatalf("expected 3 attempts, got %d", calls)
++	}
++}
++
++func TestChildEH_Retry_ExhaustionError(t *testing.T) {
++	calls := 0
++	env := map[string]any{
++		"alwaysFail": func() any {
++			calls++
++			panic(fmt.Errorf("always failing"))
++		},
++	}
++	err := childEHRunErr(t, `try { alwaysFail() } catch e { retry }`, env)
++	if !strings.Contains(err.Error(), "maximum retry count (3) exceeded") {
++		t.Fatalf("expected the distinct exhaustion error, got %v", err)
++	}
++	if calls != 4 {
++		t.Fatalf("expected 1 initial attempt + 3 retries = 4 calls, got %d", calls)
++	}
++	// The exhaustion error is classified and catchable.
++	calls = 0
++	code := `try { try { alwaysFail() } catch e { retry } } catch e2 { errtype(e2) }`
++	childEHEq(t, "retry", childEHRun(t, code, env), "exhaustion error classified as retry")
++}
++
++func TestChildEH_Retry_OutsideCatchErrors(t *testing.T) {
++	err := childEHRunErr(t, `retry`, nil)
++	if !strings.Contains(err.Error(), "retry used outside of catch block") {
++		t.Fatalf("expected runtime error for retry outside catch, got %v", err)
++	}
++	err = childEHRunErr(t, `let x = 1; retry`, nil)
++	if !strings.Contains(err.Error(), "retry used outside of catch block") {
++		t.Fatalf("expected runtime error for retry outside catch, got %v", err)
++	}
++}
++
++// --- errtype -------------------------------------------------------------
++
++func TestChildEH_Errtype_AllClasses(t *testing.T) {
++	tests := []struct {
++		code string
++		want string
++	}{
++		{`errtype(nil)`, "none"},
++		{`try { [1][5] } catch e { errtype(e) }`, "index"},
++		{`try { [1,2,3][99] } catch e { errtype(e) }`, "index"},
++		{`try { int("abc") } catch e { errtype(e) }`, "conversion"},
++		{`try { float("xy") } catch e { errtype(e) }`, "conversion"},
++		{`errtype(error("type mismatch: wanted int"))`, "type"},
++		{`errtype(error("interface conversion failed: type assertion"))`, "type"},
++		{`errtype(error("nil pointer dereference"))`, "nil"},
++		{`errtype(error("cannot use nil value here"))`, "nil"},
++		{`errtype(error("maximum retry count (3) exceeded"))`, "retry"},
++		{`errtype(error("anything", "sometag"))`, "tagged"},
++		{`try { throw(error("m", "db")) } catch e { errtype(e) }`, "tagged"},
++		{`errtype(error("no special words"))`, "custom"},
++		{`try { throw("just custom") } catch e { errtype(e) }`, "custom"},
++	}
++	for _, tt := range tests {
++		childEHEq(t, tt.want, childEHRun(t, tt.code, nil), tt.code)
++	}
++}
++
++func TestChildEH_Errtype_TaggedBeatsMessageAndArity(t *testing.T) {
++	// A non-empty tag classifies as "tagged" even if the message would
++	// classify otherwise; untagged throw/error values stay message-based.
++	childEHEq(t, "tagged", childEHRun(t, `errtype(error("index out of range", "custom-tag"))`, nil), "tag wins")
++	childEHEq(t, "index", childEHRun(t, `errtype(error("index out of range"))`, nil), "untagged falls back to message")
++	if _, err := expr.Compile(`errtype()`); err == nil {
++		t.Fatal("errtype requires exactly one argument: errtype() must not compile")
++	}
++	if _, err := expr.Compile(`errtype(1, 2)`); err == nil {
++		t.Fatal("errtype requires exactly one argument: errtype(1, 2) must not compile")
++	}
++}
++
++// --- rethrow / causes / rootcause ---------------------------------------
++
++func TestChildEH_Rethrow_ChainOrder(t *testing.T) {
++	code := `
++		try {
++			try {
++				try { throw(error("root", "r", {"k": 1})) }
++				catch e { rethrow(e, "mid") }
++			} catch e { rethrow(e, "outer") }
++		} catch e { join(map(causes(e), errmsg(#)), "|") }`
++	childEHEq(t, "outer|mid|root", childEHRun(t, code, nil), "causes ordered from err outward to root")
++	code = `
++		try {
++			try { throw(error("root", "r")) } catch e { rethrow(e, "wrapped") }
++		} catch e { string(len(causes(e))) + ":" + errmsg(rootcause(e)) + ":" + errtag(rootcause(e)) }`
++	childEHEq(t, "2:root:r", childEHRun(t, code, nil), "rootcause is the innermost error")
++}
++
++func TestChildEH_Rethrow_NewErrorShape(t *testing.T) {
++	// The rethrown error has the context as message, and empty tag/metadata.
++	code := `
++		try {
++			try { throw(error("inner", "tagged", {"a": 1})) } catch e { rethrow(e, "context") }
++		} catch e { errmsg(e) + "|" + errtag(e) + "|" + string(len(errmeta(e))) }`
++	childEHEq(t, "context||0", childEHRun(t, code, nil), "rethrow produces fresh untagged error")
++	if _, err := expr.Compile(`rethrow(error("x"))`); err == nil {
++		t.Fatal("rethrow requires exactly two arguments")
++	}
++	// First argument must be an error value.
++	err := childEHRunErr(t, `try { rethrow(42, "ctx") } catch e is "nomatch" { 1 }`, nil)
++	if !strings.Contains(err.Error(), "error value") {
++		t.Fatalf("rethrow must require an error first argument, got %v", err)
++	}
++}
++
++func TestChildEH_Causes_NoCauseSingleton(t *testing.T) {
++	childEHEq(t, 1, childEHRun(t, `len(causes(error("alone")))`, nil), "causes of plain error is one element")
++	childEHEq(t, "alone", childEHRun(t, `errmsg(causes(error("alone"))[0])`, nil), "single element is the error itself")
++	childEHEq(t, "alone", childEHRun(t, `errmsg(rootcause(error("alone")))`, nil), "rootcause of plain error is itself")
++	// Works for caught runtime errors too.
++	childEHEq(t, 1, childEHRun(t, `try { [1][5] } catch e { len(causes(e)) }`, nil), "runtime error causes singleton")
++}
++
++// --- scoped / defer ------------------------------------------------------
++
++func TestChildEH_Scoped_DeferLIFO(t *testing.T) {
++	var order []string
++	env := map[string]any{
++		"log": func(s string) any { order = append(order, s); return nil },
++		"d1":  func() any { order = append(order, "d1"); return nil },
++		"d2":  func() any { order = append(order, "d2"); return nil },
++		"d3":  func() any { order = append(order, "d3"); return nil },
++	}
++	out := childEHRun(t, `scoped { defer(d1); defer(d2); defer(d3); log("body"); 7 }`, env)
++	childEHEq(t, 7, out, "scoped yields body value")
++	childEHEq(t, "[body d3 d2 d1]", fmt.Sprintf("%v", order), "deferred callables run last-registered first")
++}
++
++func TestChildEH_Scoped_NestedScopesAndThrow(t *testing.T) {
++	var order []string
++	env := map[string]any{
++		"log":   func(s string) any { order = append(order, s); return nil },
++		"inner": func() any { order = append(order, "inner"); return nil },
++		"outer": func() any { order = append(order, "outer"); return nil },
++	}
++	code := `scoped { defer(outer); scoped { defer(inner); log("in") }; log("mid"); 1 }`
++	childEHEq(t, 1, childEHRun(t, code, env), "nested scoped")
++	childEHEq(t, "[in inner mid outer]", fmt.Sprintf("%v", order), "inner scope cleans up at its own exit")
++
++	// Deferred callables also run when the body throws.
++	order = nil
++	code = `try { scoped { defer(outer); throw("bodyfail") } } catch e { errmsg(e) }`
++	childEHEq(t, "bodyfail", childEHRun(t, code, env), "body error propagates")
++	childEHEq(t, "[outer]", fmt.Sprintf("%v", order), "deferred cleanup runs on throw")
++}
++
++func TestChildEH_Scoped_CleanupAggregate_SuccessBody(t *testing.T) {
++	env := map[string]any{
++		"failA": func() any { panic(fmt.Errorf("fail A")) },
++		"failB": func() any { panic(fmt.Errorf("fail B")) },
++		"okC":   func() any { return nil },
++	}
++	// Successful body followed by failing cleanup throws the aggregate.
++	code := `try { scoped { defer(failA); defer(okC); defer(failB); "fine" } } catch e {
++		errmsg(e) + "|" + errtag(e) + "|" + join(errmeta(e).errors, ",")
++	}`
++	// Execution order is LIFO: failB runs before failA.
++	childEHEq(t, "cleanup failed|cleanup|fail B,fail A", childEHRun(t, code, env), "aggregate error shape")
++	// Uncaught, the aggregate propagates out of the program.
++	err := childEHRunErr(t, `scoped { defer(failA); 1 }`, env)
++	if !strings.Contains(err.Error(), "cleanup failed") {
++		t.Fatalf("expected aggregate cleanup error, got %v", err)
++	}
++}
++
++func TestChildEH_Scoped_CleanupAggregate_FailingBody(t *testing.T) {
++	env := map[string]any{
++		"failA": func() any { panic(fmt.Errorf("fail A")) },
++	}
++	// Failing body + failing cleanup: the body error propagates with the
++	// aggregate appended to its cause chain.
++	code := `try { scoped { defer(failA); throw(error("body error", "body")) } } catch e {
++		errmsg(e) + "|" + errtag(e) + "|" + string(len(causes(e))) + "|" + errmsg(causes(e)[1]) + "|" + errtag(causes(e)[1])
++	}`
++	childEHEq(t, "body error|body|2|cleanup failed|cleanup", childEHRun(t, code, env), "aggregate appended to cause chain")
++
++	code = `try { scoped { defer(failA); throw("plain body fail") } } catch e {
++		errmsg(rootcause(e)) + "|" + join(errmeta(rootcause(e)).errors, ",")
++	}`
++	childEHEq(t, "cleanup failed|fail A", childEHRun(t, code, env), "rootcause reaches the aggregate")
++}
++
++func TestChildEH_Scoped_DeferOutsideScopedErrors(t *testing.T) {
++	env := map[string]any{
++		"ok": func() any { return nil },
++	}
++	err := childEHRunErr(t, `defer(ok)`, env)
++	if !strings.Contains(err.Error(), "defer() used outside of scoped block") {
++		t.Fatalf("expected defer-outside-scoped error, got %v", err)
++	}
++	// It is a runtime error, hence catchable.
++	code := `try { defer(ok) } catch e { errmsg(e) }`
++	childEHEq(t, "defer() used outside of scoped block", childEHRun(t, code, env), "catchable")
++}
++
++// --- Constant folding guarantee ------------------------------------------
++
++func TestChildEH_ConstFold_DivisionByZeroLiteral(t *testing.T) {
++	// In expr, `/` is float division: 1/0 folds to +Inf and is not an error.
++	out := childEHRun(t, `1 / 0`, nil)
++	if f, ok := out.(float64); !ok || !math.IsInf(f, 1) {
++		t.Fatalf("1 / 0 must stay +Inf (float division), got %v", out)
++	}
++	// The erroring literal division is integer modulo. Inside a try
++	// construct it must compile and stay catchable at runtime.
++	childEHEq(t, "caught:custom", childEHRun(t, `try { 1 % 0 } catch e { "caught:" + errtype(e) }`, nil), "1 % 0 in block try")
++	childEHEq(t, "fb", childEHRun(t, `try(1 % 0, "fb")`, nil), "1 % 0 in try builtin")
++	err := childEHRunErr(t, `try { 5 % 0 } catch e is "nomatch" { 1 }`, nil)
++	if !strings.Contains(err.Error(), "divide by zero") {
++		t.Fatalf("expected runtime divide-by-zero error, got %v", err)
++	}
++}
++
++func TestChildEH_ConstFold_IndexLiteral(t *testing.T) {
++	// A constant out-of-range index compiles and errors catchably at runtime
++	// with the correct classification.
++	childEHEq(t, "index", childEHRun(t, `try { [1][5] } catch e { errtype(e) }`, nil), "[1][5] classified as index")
++	childEHEq(t, "fb", childEHRun(t, `try([1][5], "fb")`, nil), "[1][5] in try builtin")
++	childEHEq(t, "fine", childEHRun(t, `try { [1,2][0] >= 1 ? "fine" : "no" } catch { "err" }`, nil), "valid constant folding still works")
++}
